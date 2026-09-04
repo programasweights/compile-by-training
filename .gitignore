@@ -1,0 +1,7 @@
+*.paw
+*.part
+__pycache__/
+.cache/
+.venv/
+adapter/
+examples.json

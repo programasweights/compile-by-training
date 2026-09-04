@@ -2,12 +2,12 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "gguf>=0.10",
-#   "httpx>=0.27",
-#   "peft>=0.15",
-#   "safetensors>=0.4",
-#   "torch>=2.4",
-#   "transformers>=4.51,<6",
+#   "gguf>=0.10,<1",
+#   "httpx>=0.27,<1",
+#   "peft>=0.15,<1",
+#   "safetensors>=0.4,<1",
+#   "torch>=2.4,<2.15",
+#   "transformers>=4.57,<6",
 # ]
 # ///
 """Compile a natural-language specification into a finetuned PAW program."""
@@ -28,7 +28,7 @@ import time
 import zipfile
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +49,7 @@ DEFAULT_TEACHER_API_URL = "https://api.openai.com/v1"
 DEFAULT_HF_ASSET_URL = "https://huggingface.co/programasweights/paw-programs/resolve/main"
 DEFAULT_INTERPRETER = "Qwen/Qwen3-0.6B"
 DEFAULT_BASE_COMPILER = "paw-4b-qwen3-0.6b"
+DEFAULT_RECIPE_MEMORY_GIB = 38.0
 DEFAULT_TARGET_MODULES = (
     "q_proj",
     "k_proj",
@@ -334,6 +335,17 @@ def read_spec(args: argparse.Namespace) -> str:
     return spec
 
 
+def validate_destinations(args: argparse.Namespace) -> None:
+    destinations = (
+        ("output", args.output),
+        ("saved examples", args.save_examples),
+        ("kept adapter", args.keep_adapter),
+    )
+    for label, path in destinations:
+        if path is not None and path.exists() and not args.force:
+            raise FileExistsError(f"{label} path {path} already exists; pass --force to replace it")
+
+
 def auth_headers(api_key: str | None = None) -> dict[str, str]:
     headers = {"Content-Type": "application/json", "User-Agent": "compile-by-training/1"}
     if api_key:
@@ -442,11 +454,14 @@ def download_mapper_asset(
     raise RuntimeError(f"timed out waiting for {filename} (HTTP {statuses})")
 
 
-def parse_examples(content: str) -> list[dict[str, str]]:
-    try:
-        value = json.loads(content)
-    except json.JSONDecodeError:
-        return []
+def parse_examples(content: Any) -> list[dict[str, str]]:
+    if isinstance(content, str):
+        try:
+            value = json.loads(content)
+        except json.JSONDecodeError:
+            return []
+    else:
+        value = content
     if isinstance(value, dict):
         value = next(
             (
@@ -522,6 +537,40 @@ def synth_cache_path(cache_dir: Path, spec: str, teacher: Teacher) -> Path:
     return cache_dir / "synth" / f"{digest}.json"
 
 
+def cached_teacher_examples(
+    cache_dir: Path, spec: str, teacher: Teacher
+) -> list[dict[str, str]] | None:
+    cache_path = synth_cache_path(cache_dir, spec, teacher)
+    if not cache_path.is_file():
+        return None
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(cached, list) or len(cached) < teacher.examples:
+        return None
+    examples = parse_examples(cached)
+    if len(examples) < teacher.examples:
+        return None
+    return examples[: teacher.examples]
+
+
+def validate_teacher_access(spec: str, recipe: Recipe, cache_dir: Path) -> bool:
+    if os.environ.get("OPENAI_API_KEY") or os.environ.get("TEACHER_API_KEY"):
+        return False
+    missing = [
+        teacher.model
+        for teacher in recipe.teachers
+        if cached_teacher_examples(cache_dir, spec, teacher) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "set OPENAI_API_KEY (or TEACHER_API_KEY) for teacher synthesis; "
+            f"no complete cache for {', '.join(missing)}"
+        )
+    return True
+
+
 async def synthesize_teacher(
     client: Any,
     spec: str,
@@ -532,11 +581,10 @@ async def synthesize_teacher(
     cache_dir: Path,
 ) -> list[dict[str, str]]:
     cache_path = synth_cache_path(cache_dir, spec, teacher)
-    if cache_path.is_file():
-        cached = json.loads(cache_path.read_text(encoding="utf-8"))
-        if isinstance(cached, list) and len(cached) >= teacher.examples:
-            log(f"     {teacher.model}: using {teacher.examples} cached examples")
-            return cached[: teacher.examples]
+    cached = cached_teacher_examples(cache_dir, spec, teacher)
+    if cached is not None:
+        log(f"     {teacher.model}: using {teacher.examples} cached examples")
+        return cached
 
     semaphore = asyncio.Semaphore(recipe.synth_concurrency)
     required_calls = math.ceil(teacher.examples / teacher.examples_per_call)
@@ -588,16 +636,17 @@ async def synthesize_teacher(
         )
     examples = examples[: teacher.examples]
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(examples, ensure_ascii=False), encoding="utf-8")
+    temporary = cache_path.with_suffix(f".{os.getpid()}.part")
+    temporary.write_text(json.dumps(examples, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(cache_path)
     return examples
 
 
 async def synthesize(spec: str, recipe: Recipe, cache_dir: Path) -> list[list[dict[str, str]]]:
     import httpx
 
-    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("TEACHER_API_KEY")
-    if not api_key:
-        raise RuntimeError("set OPENAI_API_KEY (or TEACHER_API_KEY) for teacher synthesis")
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("TEACHER_API_KEY") or ""
+    validate_teacher_access(spec, recipe, cache_dir)
     api_url = os.environ.get("TEACHER_API_URL", DEFAULT_TEACHER_API_URL).rstrip("/")
     log("2/4  Synthesizing training examples...")
     limits = httpx.Limits(
@@ -754,16 +803,80 @@ def chunked_loss_backward(
     return loss_sum
 
 
+def cuda_is_advertised(torch: Any) -> bool:
+    try:
+        if torch.cuda.device_count() > 0:
+            return True
+    except Exception:
+        pass
+    for name in ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "SLURM_JOB_GPUS"):
+        value = os.environ.get(name)
+        if value is not None and value.strip().lower() not in ("", "-1", "none", "void"):
+            return True
+    return False
+
+
 def choose_device(requested: str) -> Any:
     import torch
 
     if requested != "auto":
-        return torch.device(requested)
+        device = torch.device(requested)
+        if device.type not in ("cuda", "mps", "cpu"):
+            raise ValueError("device must be auto, cuda, mps, or cpu")
+        return device
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if cuda_is_advertised(torch):
+        raise RuntimeError(
+            "a CUDA GPU is visible but PyTorch cannot initialize CUDA; "
+            "check the driver/runtime instead of falling back to CPU"
+        )
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def preflight_device(requested: str, recipe: Recipe) -> Any:
+    import torch
+
+    device = choose_device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but PyTorch cannot initialize CUDA")
+    if device.type == "mps" and not (
+        hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    ):
+        raise RuntimeError("MPS was requested but is not available")
+    try:
+        probe = torch.empty(1, device=device)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        elif device.type == "mps":
+            torch.mps.synchronize()
+        del probe
+    except Exception as exc:
+        raise RuntimeError(f"{device} preflight allocation failed: {exc}") from exc
+
+    if device.type == "cuda":
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        free_gib = free_bytes / 1024**3
+        total_gib = total_bytes / 1024**3
+        name = torch.cuda.get_device_name(device)
+        log(f"Preflight: {device} ({name}; {free_gib:.1f}/{total_gib:.1f} GiB free)")
+        if (
+            free_gib < DEFAULT_RECIPE_MEMORY_GIB
+            and recipe.micro_batch_size >= Recipe().micro_batch_size
+            and not recipe.gradient_checkpointing
+        ):
+            log(
+                "Warning: the default recipe uses about 38 GiB; reduce "
+                "--micro-batch-size or enable --gradient-checkpointing."
+            )
+    elif device.type == "mps":
+        log("Preflight: mps")
+    else:
+        log("Preflight: cpu")
+        log("Warning: the default recipe is slow on CPU; use an accelerator when available.")
+    return device
 
 
 def cosine_learning_rate(step: int, total: int, high: float, low: float, warmup: float) -> float:
@@ -780,7 +893,7 @@ def train(
     pseudo_program: str,
     raw_pools: list[list[dict[str, str]]],
     output_dir: Path,
-    requested_device: str,
+    device: Any,
 ) -> tuple[Path, str, list[float]]:
     import torch
     from peft import LoraConfig, PeftModel, get_peft_model
@@ -789,9 +902,8 @@ def train(
     log("3/4  Finetuning the neural program...")
     random.seed(recipe.seed)
     torch.manual_seed(recipe.seed)
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         torch.cuda.manual_seed_all(recipe.seed)
-    device = choose_device(requested_device)
     if device.type == "cuda":
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     elif device.type == "mps":
@@ -812,7 +924,7 @@ def train(
 
     model = AutoModelForCausalLM.from_pretrained(
         recipe.interpreter,
-        torch_dtype=dtype,
+        dtype=dtype,
         trust_remote_code=True,
     ).to(device)
     model.config.use_cache = False
@@ -1019,7 +1131,7 @@ def package_program(
             },
             "program_assets": runtime["program_assets"],
             "prompt_template": runtime["prompt_template"],
-            "created_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "base_program_id": mapper["program_id"],
             "base_compiler_snapshot": mapper["compiler_snapshot"],
             "compile_by_training": {
@@ -1080,6 +1192,7 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        started = time.perf_counter()
         recipe = recipe_from_args(args)
         if args.print_config:
             print(json.dumps(serializable_recipe(recipe), indent=2))
@@ -1087,7 +1200,11 @@ def main() -> int:
         spec = read_spec(args)
         if args.output.suffix != ".paw":
             args.output = args.output.with_suffix(args.output.suffix + ".paw")
+        validate_destinations(args)
         args.cache_dir.mkdir(parents=True, exist_ok=True)
+        if validate_teacher_access(spec, recipe, args.cache_dir):
+            log("Preflight: all teacher examples are cached; no teacher API key needed.")
+        device = preflight_device(args.device, recipe)
         mapper = compile_mapper(spec, recipe, args.cache_dir, args.asset_timeout)
         pools = asyncio.run(synthesize(spec, recipe, args.cache_dir))
         if args.save_examples:
@@ -1103,7 +1220,7 @@ def main() -> int:
                 mapper["pseudo_program"],
                 pools,
                 Path(temporary) / "adapter",
-                args.device,
+                device,
             )
             if args.keep_adapter:
                 if args.keep_adapter.exists():
@@ -1128,6 +1245,8 @@ def main() -> int:
             "path": str(output.resolve()),
             "base_program_id": mapper["program_id"],
             "final_loss": losses[-1],
+            "device": str(device),
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
         if args.json:
             print(json.dumps(result))

@@ -4,16 +4,18 @@ Turn a natural-language function description into a reusable neural program.
 
 Compile by Training uses teacher models to generate examples, finetunes a small PAW interpreter, and produces a `.paw` function that runs locally without further teacher calls.
 
+Requires Python 3.10+, [`uv`](https://docs.astral.sh/uv/), and an OpenAI API key. The default recipe is intended for an accelerator with about 40 GB of available memory; use a lower `--micro-batch-size` or `--gradient-checkpointing` on smaller devices.
+
 ## Compile
 
-Set an OpenAI API key and run the script with [`uv`](https://docs.astral.sh/uv/):
+Set an OpenAI API key and run the script:
 
 ```bash
 export OPENAI_API_KEY=...
 uv run compile.py "Classify sentiment. Return only positive, negative, or neutral." -o sentiment.paw
 ```
 
-The script prints a program ID. Use it with the PAW Python package:
+The script saves `sentiment.paw`, installs it in the local PAW cache, and prints its program ID. Use the ID with the PAW Python package:
 
 ```bash
 pip install programasweights --extra-index-url https://pypi.programasweights.com/simple/
@@ -27,6 +29,8 @@ print(sentiment("I loved it."))
 ```
 
 The program downloads the shared 0.6B interpreter once, then runs locally. A PAW API key is optional; setting `PAW_API_KEY` provides higher hosted compile limits.
+
+Mapper assets and completed teacher synthesis are cached, so rerunning the same specification and recipe reuses finished work.
 
 ## Customize
 

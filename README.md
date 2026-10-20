@@ -61,9 +61,37 @@ uv run compile.py --help
 
 The implementation is contained in [`compile.py`](compile.py).
 
-## Paper
+## Citation
 
-[Compile by Training: Turning Natural-Language Specifications into Local Neural Functions](https://arxiv.org/abs/2609.04199), Yuntian Deng, Pengyu Nie, and Stuart Shieber.
+If you use this compiler in research, please cite Compile by Training for the training-based compiler and Program-as-Weights for the underlying fuzzy-function programming model.
+
+**[Compile by Training: Turning Natural-Language Specifications into Local Neural Functions](https://arxiv.org/abs/2609.04199)**
+
+```bibtex
+@misc{paw_2609_04199,
+  title = {{Compile by Training: Turning Natural-Language Specifications into Local Neural Functions}},
+  author = {Deng, Yuntian and Nie, Pengyu and Shieber, Stuart},
+  year = {2026},
+  note = {arXiv preprint},
+  eprint = {2609.04199},
+  archivePrefix = {arXiv},
+  url = {https://arxiv.org/abs/2609.04199}
+}
+```
+
+**[Program-as-Weights: A Programming Paradigm for Fuzzy Functions](https://arxiv.org/abs/2607.02512)**
+
+```bibtex
+@misc{paw_2607_02512,
+  title = {{Program-as-Weights: A Programming Paradigm for Fuzzy Functions}},
+  author = {Zhang, Wentao and Hotsko, Liliana and Kim, Woojeong and Nie, Pengyu and Shieber, Stuart and Deng, Yuntian},
+  year = {2026},
+  note = {arXiv preprint},
+  eprint = {2607.02512},
+  archivePrefix = {arXiv},
+  url = {https://arxiv.org/abs/2607.02512}
+}
+```
 
 ## License
 
